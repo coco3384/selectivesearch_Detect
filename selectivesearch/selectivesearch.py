@@ -8,6 +8,7 @@ import skimage.transform
 import skimage.util
 import skimage.segmentation
 import numpy
+import math
 
 
 # "Selective Search for Object Recognition" by J.R.R. Uijlings et al.
@@ -25,7 +26,7 @@ def _generate_segments(im_orig, scale, sigma, min_size):
     im_mask = skimage.segmentation.felzenszwalb(
         skimage.util.img_as_float(im_orig), scale=scale, sigma=sigma,
         min_size=min_size)
-
+    
     # merge mask channel to the image as a 4th channel
     im_orig = numpy.append(
         im_orig, numpy.zeros(im_orig.shape[:2])[:, :, numpy.newaxis], axis=2)
@@ -155,9 +156,8 @@ def _extract_regions(img):
 
     # pass 1: count pixel positions
     for y, i in enumerate(img):
-
         for x, (r, g, b, l) in enumerate(i):
-
+            
             # initialize a new region
             if l not in R:
                 R[l] = {
@@ -173,6 +173,8 @@ def _extract_regions(img):
                 R[l]["max_x"] = x
             if R[l]["max_y"] < y:
                 R[l]["max_y"] = y
+            
+            R[l]['bbox_size'] = (R[l]['max_x'] - R[l]['min_x']) * (R[l]['max_y'] - R[l]['min_y'])
 
     # pass 2: calculate texture gradient
     tex_grad = _calc_texture_gradient(img)
@@ -191,6 +193,7 @@ def _extract_regions(img):
     return R
 
 
+    
 def _extract_neighbours(regions):
 
     def intersect(a, b):
@@ -207,12 +210,22 @@ def _extract_neighbours(regions):
 
     R = list(regions.items())
     neighbours = []
+    neighbours_mask = numpy.zeros(len(R))
+
     for cur, a in enumerate(R[:-1]):
-        for b in R[cur + 1:]:
+        for cur2, b in enumerate(R[cur + 1:]):
             if intersect(a[1], b[1]):
                 neighbours.append((a, b))
+                neighbours_mask[cur] = True
+                neighbours_mask[cur + cur2 + 1] = True
 
-    return neighbours
+    # test
+    for i, there_is_neighbours in enumerate(neighbours_mask):
+        if not there_is_neighbours:
+            assert R[i] not in [b for (a, b) in neighbours]
+            
+
+    return neighbours, neighbours_mask
 
 
 def _merge_regions(r1, r2):
@@ -222,6 +235,10 @@ def _merge_regions(r1, r2):
         "min_y": min(r1["min_y"], r2["min_y"]),
         "max_x": max(r1["max_x"], r2["max_x"]),
         "max_y": max(r1["max_y"], r2["max_y"]),
+        'og_min_x': min(r1["og_min_x"], r2["og_min_x"]),
+        'og_min_y': min(r1["og_min_y"], r2["og_min_y"]),
+        'og_max_x': max(r1["og_max_x"], r2["og_max_x"]),
+        'og_max_y': max(r1["og_max_y"], r2["og_max_y"]),
         "size": new_size,
         "hist_c": (
             r1["hist_c"] * r1["size"] + r2["hist_c"] * r2["size"]) / new_size,
@@ -229,11 +246,34 @@ def _merge_regions(r1, r2):
             r1["hist_t"] * r1["size"] + r2["hist_t"] * r2["size"]) / new_size,
         "labels": r1["labels"] + r2["labels"]
     }
+    rt['bbox_size'] = (rt['max_x'] - rt['min_x']) * (rt['max_y'] - rt['min_y'])
     return rt
+
+def _expand_regions(regions, border, x_lim, y_lim):
+    R = regions.items()
+    R_new = {}
+    for i, r in enumerate(R):
+        r_new = {
+            'min_x': max(0, r[1]['min_x'] - border),
+            'min_y': max(0, r[1]['min_y'] - border),
+            'max_x': min(x_lim, r[1]['max_x'] + border),
+            'max_y': min(y_lim, r[1]['max_y'] + border),
+            'og_min_x': r[1]['min_x'], 
+            'og_min_y': r[1]['min_y'], 
+            'og_max_x': r[1]['max_x'], 
+            'og_max_y': r[1]['max_y'], 
+            'size': r[1]['size'],
+            'hist_c': r[1]['hist_c'],
+            'hist_t': r[1]['hist_t'],
+            'labels': r[1]['labels'],
+        }
+        r_new['bbox_size'] = (r[1]['max_x'] - r[1]['min_x']) * (r[1]['max_y'] - r[1]['min_y'])
+        R_new[i] = r_new
+    return R_new
 
 
 def selective_search(
-        im_orig, scale=1.0, sigma=0.8, min_size=50):
+        im_orig, scale=1.0, sigma=0.8, min_size=50, region_pop=False, max_region_size=3000, border=10):
     '''Selective Search
 
     Parameters
@@ -263,8 +303,7 @@ def selective_search(
     '''
     assert im_orig.shape[2] == 3, "3ch image is expected"
 
-    # load image and get smallest regions
-    # region label is stored in the 4th value of each pixel [r,g,b,(region)]
+    # load image and get smallest regions, region label is stored in the 4th value of each pixel [r,g,b,(region)]
     img = _generate_segments(im_orig, scale, sigma, min_size)
 
     if img is None:
@@ -272,18 +311,40 @@ def selective_search(
 
     imsize = img.shape[0] * img.shape[1]
     R = _extract_regions(img)
+    R = _expand_regions(R, border=border, x_lim=img.shape[1], y_lim=img.shape[0])
+    origin_size_of_R = len(R.keys())
 
     # extract neighbouring information
-    neighbours = _extract_neighbours(R)
+    neighbours, neighbours_mask = _extract_neighbours(R)
+
+    # R = _crop_no_neigublours_regions(no_neighbours_index, max_region_size)
+
 
     # calculate initial similarities
     S = {}
     for (ai, ar), (bi, br) in neighbours:
         S[(ai, bi)] = _calc_sim(ar, br, imsize)
 
+
+
+    # test
+
+    first_region_to_pop = []
+    if region_pop:
+        key_to_delete = []
+        for t in R.keys():
+            if R[t]['bbox_size'] > max_region_size:
+                for k, v in list(S.items()):
+                    if t in k:
+                        if k not in key_to_delete:
+                            key_to_delete.append(k)
+                first_region_to_pop.append(t)
+        for k in key_to_delete:
+            del S[k]
+
     # hierarchal search
     while S != {}:
-
+        # check anny region is larger than prefered regional size
         # get highest similarity
         i, j = sorted(S.items(), key=lambda i: i[1])[-1][0]
 
@@ -302,18 +363,40 @@ def selective_search(
             del S[k]
 
         # calculate similarity set with the new region
-        for k in [a for a in key_to_delete if a != (i, j)]:
-            n = k[1] if k[0] in (i, j) else k[0]
-            S[(t, n)] = _calc_sim(R[t], R[n], imsize)
+        if R[t]['bbox_size'] > max_region_size:
+            continue
+        else:
+            for k in [a for a in key_to_delete if a != (i, j)]:
+                n = k[1] if k[0] in (i, j) else k[0]
+                S[(t, n)] = _calc_sim(R[t], R[n], imsize)
 
     regions = []
-    for k, r in list(R.items()):
-        regions.append({
-            'rect': (
-                r['min_x'], r['min_y'],
-                r['max_x'] - r['min_x'], r['max_y'] - r['min_y']),
-            'size': r['size'],
-            'labels': r['labels']
-        })
 
-    return img, regions
+    for k, r in list(R.items()):
+        # To Do: 
+        if k not in first_region_to_pop:
+            regions.append({
+                'rect': (
+                    r['min_x'], r['min_y'],
+                    r['max_x'] - r['min_x'], r['max_y'] - r['min_y']),
+                'bbox_size': r['bbox_size'],
+                'size': r['size'],
+                'labels': r['labels']
+            })
+
+    og_regions = []
+
+    """
+    for k, r in list(R.items()):
+        if k in R_pop_list:
+            og_regions.append({
+                'rect': (
+                    r['og_min_x'], r['og_min_y'],
+                    r['og_max_x'] - r['og_min_x'], r['og_max_y'] - r['og_min_y']),
+                'size': r['size'],
+                'labels': r['labels']
+            })
+    """
+
+    return img, regions, og_regions
+
